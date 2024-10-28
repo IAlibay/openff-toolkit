@@ -33,11 +33,13 @@ from openff.toolkit.utils.exceptions import (
     ChargeMethodUnavailableError,
     ChemicalEnvironmentParsingError,
     ConformerGenerationError,
+    EmptyInChiError,
     InChIParseError,
     IncorrectNumConformersError,
     IncorrectNumConformersWarning,
     InvalidIUPACNameError,
     InvalidToolkitError,
+    MultipleComponentsInMoleculeWarning,
     NotAttachedToMoleculeError,
     RadicalsNotSupportedError,
     ToolkitUnavailableException,
@@ -53,6 +55,8 @@ from openff.toolkit.utils.toolkits import (
     ToolkitRegistry,
     ToolkitWrapper,
 )
+
+_rng = np.random.default_rng()
 
 
 def get_mini_drug_bank(toolkit_class, xfail_mols=None):
@@ -189,8 +193,6 @@ rdkit_inchi_stereochemistry_lost = [
     "DrugBank_1962",
     "DrugBank_5043",
     "DrugBank_2519",
-    "DrugBank_7124",
-    "DrugBank_6865",
 ]
 
 openeye_iupac_bad_stereo = [
@@ -296,6 +298,20 @@ class TestOpenEyeToolkitWrapper:
     """Test the OpenEyeToolkitWrapper"""
 
     # TODO: Make separate smiles_add_H and smiles_explicit_H tests
+
+    def test_supported_charge_methods(self):
+        methods = OpenEyeToolkitWrapper().supported_charge_methods
+
+        assert "am1-mulliken" in methods
+        assert "am1bcc" in methods
+        assert "am1bccelf10" in methods
+        assert "am1elf10" in methods
+        assert "am1bccnosymspt" in methods
+        assert "mmff94" in methods
+        assert "gasteiger" in methods
+
+        assert "zeros" not in methods
+        assert "formal_charge" not in methods
 
     def test_smiles(self):
         """Test OpenEyeToolkitWrapper to_smiles() and from_smiles()"""
@@ -708,6 +724,14 @@ class TestOpenEyeToolkitWrapper:
 
         OpenEyeToolkitWrapper().from_openeye(oemol)
 
+    def test_from_openeye_multiple_molecule(self):
+        """Test that parsing a OEMol that is actually multiple disconnected molecules raises a warning"""
+        from openeye import oechem
+        oemol = oechem.OEMol()
+        oechem.OESmilesToMol(oemol, "C.N")
+        with pytest.warns(MultipleComponentsInMoleculeWarning, match="more than one molecule", ):
+            OpenEyeToolkitWrapper().from_openeye(oemol)
+
     def test_from_openeye_implicit_hydrogen(self):
         """
         Test OpenEyeToolkitWrapper for loading a molecule with implicit
@@ -825,6 +849,19 @@ class TestOpenEyeToolkitWrapper:
 
         with pytest.raises(InChIParseError, match="ksbfksfksfksbfks"):
             Molecule.from_inchi(inchi, toolkit_registry=toolkit)
+
+    @pytest.mark.parametrize("method", ["to_inchi", "to_inchikey"])
+    def test_empty_inchi(self, method):
+        """Reproduce Issue #1897"""
+        with pytest.raises(
+            EmptyInChiError,
+            match="failed to generate" + (".*key" if method == "to_inchikey" else ""),
+        ):
+            # call either .to_inchi or .to_inchikey
+            getattr(
+                Molecule.from_mapped_smiles("[H:5][S:3]#[N+:2][S:1][H:4]"),
+                method,
+            )(toolkit_registry=OpenEyeToolkitWrapper())
 
     @pytest.mark.parametrize(
         "molecule",
@@ -1198,7 +1235,7 @@ class TestOpenEyeToolkitWrapper:
         )
 
         # Test loading from file-like object
-        with open(filename, "r") as infile:
+        with open(filename) as infile:
             molecule2 = Molecule(
                 infile, file_format="MOL2", toolkit_registry=toolkit_wrapper
             )
@@ -2047,10 +2084,44 @@ class TestOpenEyeToolkitWrapper:
                 smarts="foobar",
             )
 
+    def test_charge_method_api_continuity(self):
+        """Test rough continuity of OpenEyeToolkitWrapper.SUPPORTED_CHARGE_METHODS"""
+
+        assert OpenEyeToolkitWrapper.SUPPORTED_CHARGE_METHODS["gasteiger"] == {
+            "oe_charge_method": "OEGasteigerCharges",
+            "min_confs": 0,
+            "max_confs": 0,
+            "rec_confs": 0,
+        }
+        assert OpenEyeToolkitWrapper.SUPPORTED_CHARGE_METHODS["am1bcc"] == {
+            "oe_charge_method": "OEAM1BCCCharges",
+            "min_confs": 1,
+            "max_confs": 1,
+            "rec_confs": 1,
+        }
+
+        assert OpenEyeToolkitWrapper.SUPPORTED_CHARGE_METHODS["am1bccelf10"] == {
+            "oe_charge_method": "OEAM1BCCELF10Charges",
+            "min_confs": 1,
+            "max_confs": None,
+            "rec_confs": 500,
+        }
+
 
 @requires_rdkit
 class TestRDKitToolkitWrapper:
     """Test the RDKitToolkitWrapper"""
+
+    def test_supported_charge_methods(self):
+        methods = RDKitToolkitWrapper().supported_charge_methods
+
+        assert "mmff94" in methods
+        assert "gasteiger" in methods
+
+        assert "zeros" not in methods
+        assert "formal_charge" not in methods
+        assert "am1bcc" not in methods
+        assert "am1bccelf10" not in methods
 
     def test_smiles(self):
         """Test RDKitToolkitWrapper to_smiles() and from_smiles()"""
@@ -2270,6 +2341,19 @@ class TestRDKitToolkitWrapper:
             assert molecule.is_isomorphic_with(
                 mol2, bond_order_matching=False, toolkit_registry=toolkit
             )
+
+    @pytest.mark.parametrize("method", ["to_inchi", "to_inchikey"])
+    def test_empty_inchi(self, method):
+        """Reproduce Issue #1897"""
+        with pytest.raises(
+            EmptyInChiError,
+            match="failed to generate" + (".*key" if method == "to_inchikey" else ""),
+        ):
+            # call either .to_inchi or .to_inchikey
+            getattr(
+                Molecule.from_mapped_smiles("[H:5][S:3]#[N+:2][S:1][H:4]"),
+                method,
+            )(toolkit_registry=RDKitToolkitWrapper())
 
     def test_smiles_charged(self):
         """Test RDKitWrapper functions for reading/writing charged SMILES"""
@@ -2576,6 +2660,13 @@ class TestRDKitToolkitWrapper:
         rdmol = Chem.MolFromSmiles("[Zn+2]")
 
         RDKitToolkitWrapper().from_rdkit(rdmol)
+
+    def test_from_rdkit_multiple_molecule(self):
+        """Test that parsing a rdmol that is actually multiple disconnected molecules raises a warning"""
+        from rdkit import Chem
+        rdmol = Chem.MolFromSmiles("C.N")
+        with pytest.warns(MultipleComponentsInMoleculeWarning, match="more than one molecule"):
+            RDKitToolkitWrapper().from_rdkit(rdmol)
 
     @pytest.mark.parametrize(
         "smiles, expected_map", [("[Cl:1][Cl]", {0: 1}), ("[Cl:1][Cl:2]", {0: 1, 1: 2})]
@@ -3016,8 +3107,8 @@ class TestRDKitToolkitWrapper:
 
     def test_elf_compute_rms_matrix(self, formic_acid_molecule: Molecule):
         """Test the computation of the ELF conformer RMS matrix."""
-        formic_acid_molecule.add_conformer(np.random.random((5, 3)) * unit.angstrom)
-        formic_acid_molecule.add_conformer(np.random.random((5, 3)) * unit.angstrom)
+        formic_acid_molecule.add_conformer(_rng.random((5, 3)) * unit.angstrom)
+        formic_acid_molecule.add_conformer(_rng.random((5, 3)) * unit.angstrom)
 
         rms_matrix = RDKitToolkitWrapper._elf_compute_rms_matrix(formic_acid_molecule)
 
@@ -3070,7 +3161,7 @@ class TestRDKitToolkitWrapper:
     ):
         """Test the greedy selection of 'diverse' ELF conformers."""
 
-        formic_acid_molecule.add_conformer(np.random.random((5, 3)) * unit.angstrom)
+        formic_acid_molecule.add_conformer(_rng.random((5, 3)) * unit.angstrom)
         formic_acid_molecule.add_conformer(formic_acid_molecule.conformers[0] * 1.1)
         formic_acid_molecule.add_conformer(formic_acid_molecule.conformers[0] * 1.2)
 
@@ -3382,11 +3473,30 @@ class TestRDKitToolkitWrapper:
         # TODO: Add read/write tests for gzipped files
         # TODO: Add write tests for all formats
 
+    def test_charge_method_api_continuity(self):
+        """Test rough continuity of RDKitToolkitWrapper.SUPPORTED_CHARGE_METHODS"""
+        assert isinstance(RDKitToolkitWrapper.SUPPORTED_CHARGE_METHODS, set)
+
+        assert "mmff94" in RDKitToolkitWrapper.SUPPORTED_CHARGE_METHODS
+        assert "gasteiger" in RDKitToolkitWrapper.SUPPORTED_CHARGE_METHODS
+
 
 @requires_ambertools
 @requires_rdkit
 class TestAmberToolsToolkitWrapper:
     """Test the AmberToolsToolkitWrapper"""
+
+    def test_supported_charge_methods(self):
+        methods = AmberToolsToolkitWrapper().supported_charge_methods
+
+        assert "gasteiger" in methods
+        assert "am1bcc" in methods
+        assert "am1-mulliken" in methods
+
+        assert "zeros" not in methods
+        assert "formal_charge" not in methods
+        assert "mmff94" not in methods
+        assert "am1bccelf10" not in methods
 
     def test_assign_partial_charges_am1bcc(self):
         """Test AmberToolsToolkitWrapper assign_partial_charges() with am1bcc"""
@@ -3933,6 +4043,20 @@ class TestAmberToolsToolkitWrapper:
 class TestBuiltInToolkitWrapper:
     """Test the BuiltInToolkitWrapper"""
 
+    def test_supported_charge_methods(self):
+        methods = BuiltInToolkitWrapper().supported_charge_methods
+
+        assert "am1-mulliken" not in methods
+        assert "am1bcc" not in methods
+        assert "am1bccelf10" not in methods
+        assert "am1elf10" not in methods
+        assert "am1bccnosymspt" not in methods
+        assert "mmff94" not in methods
+        assert "gasteiger" not in methods
+
+        assert "zeros" in methods
+        assert "formal_charge" in methods
+
     @pytest.mark.parametrize("partial_charge_method", ["zeros", "formal_charge"])
     def test_assign_partial_charges_neutral(self, partial_charge_method):
         """Test BuiltInToolkitWrapper assign_partial_charges()"""
@@ -4047,6 +4171,21 @@ class TestBuiltInToolkitWrapper:
                 use_conformers=molecule.conformers,
                 strict_n_conformers=True,
             )
+
+    def test_charge_method_api_continuity(self):
+        """Test rough continuity of BuiltinToolkitWrapper.PARTIAL_CHARGE_METHODS"""
+        assert isinstance(BuiltInToolkitWrapper.PARTIAL_CHARGE_METHODS, dict)
+
+        assert BuiltInToolkitWrapper.PARTIAL_CHARGE_METHODS["zeros"] == {
+            "rec_confs": 0,
+            "min_confs": 0,
+            "max_confs": 0,
+        }
+        assert BuiltInToolkitWrapper.PARTIAL_CHARGE_METHODS["formal_charge"] == {
+            "rec_confs": 0,
+            "min_confs": 0,
+            "max_confs": 0,
+        }
 
 
 class TestToolkitWrapper:
@@ -4482,7 +4621,7 @@ class TestToolkitRegistry:
         # Keep a copy of the original registry since this is a "global" variable accessible to other modules
         from copy import deepcopy
 
-        global_registry_copy = deepcopy(GLOBAL_TOOLKIT_REGISTRY)
+        global_registry_copy = deepcopy(GLOBAL_TOOLKIT_REGISTRY)  # noqa: F823
         first_toolkit = type(GLOBAL_TOOLKIT_REGISTRY.registered_toolkits[0])
         num_toolkits = len(GLOBAL_TOOLKIT_REGISTRY.registered_toolkits)
 
@@ -4492,7 +4631,7 @@ class TestToolkitRegistry:
             type(tk) for tk in GLOBAL_TOOLKIT_REGISTRY.registered_toolkits
         ]
         assert (
-            len(GLOBAL_TOOLKIT_REGISTRY.registered_toolkits) == num_toolkits - 1  # noqa
+            len(GLOBAL_TOOLKIT_REGISTRY.registered_toolkits) == num_toolkits - 1
         )
 
         GLOBAL_TOOLKIT_REGISTRY = deepcopy(global_registry_copy)  # noqa
